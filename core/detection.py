@@ -1,3 +1,4 @@
+from .avoidance import ObstacleMap, extract_obstacle_map
 """
 Player detection helpers for GraphBot.
 
@@ -1295,3 +1296,131 @@ def draw_obstacles_overlay(bgr, result, field_width=None, show_players=True, sho
         cv2.LINE_AA,
     )
     return out
+
+
+def detect_all_players_robust(screenshot_bgr, obstacles):
+    """
+    Robust player detection:
+    - Mask out obstacle pixels using obstacle_map.mask (or circle list).
+    - Detect vivid colored sector blobs inside player spheres in HSV ((12, 80, 120) to (165, 255, 255)).
+    - Reject Nameplates ('111', 'Multivac', 'Wolfram'): Verify that a 9px radius patch
+      around each candidate centroid has at least 35 non-white, non-black solid sphere
+      pixels (25 < gray < 232) and bounding box aspect ratio <= 2.2.
+    - Active Player Detection: Check for red glow strictly in a 15px ring around confirmed
+      left-side (x <= w/2) player spheres.
+    """
+    hsv = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    # 1. 屏蔽所有黑色障碍区域
+    if isinstance(obstacles, ObstacleMap):
+        obs_mask = obstacles.mask
+    else:
+        obs_mask = np.zeros((h, w), dtype=np.uint8)
+        for ox, oy, orad in obstacles:
+            cv2.circle(obs_mask, (int(ox), int(oy)), int(orad) + 2, 255, -1)
+
+    # 2. 提取所有小兵球体内部的鲜艳扇形色块 (S > 80, V > 120)
+    vivid_mask = cv2.inRange(hsv, (12, 80, 120), (165, 255, 255))
+    vivid_mask = cv2.bitwise_and(vivid_mask, cv2.bitwise_not(obs_mask))
+
+    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    vivid_blobs = cv2.morphologyEx(vivid_mask, cv2.MORPH_CLOSE, k_small)
+
+    cnts, _ = cv2.findContours(vivid_blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < 8 or area > 450:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw > 26 or bh > 26 or bw / max(1, bh) > 2.2:
+            continue
+
+        M = cv2.moments(cnt)
+        if M["m00"] <= 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        # 核心验证：以 (cx, cy) 为中心取半径 9 的区域验证实心小兵球体
+        r_check = 9
+        x1, y1 = max(0, int(cx) - r_check), max(0, int(cy) - r_check)
+        x2, y2 = min(w, int(cx) + r_check + 1), min(h, int(cy) + r_check + 1)
+        patch_gray = gray[y1:y2, x1:x2]
+        if patch_gray.size == 0:
+            continue
+
+        body_pixels = (patch_gray < 232) & (patch_gray > 25)
+        if np.sum(body_pixels) < 35:
+            continue
+
+        bm = cv2.moments(body_pixels.astype(np.uint8))
+        if bm["m00"] > 0:
+            rcx = x1 + bm["m10"] / bm["m00"]
+            rcy = y1 + bm["m01"] / bm["m00"]
+            if np.hypot(rcx - cx, rcy - cy) <= 5.0:
+                cx, cy = rcx, rcy
+
+        px, py = int(round(cx)), int(round(cy))
+
+        merged = False
+        for i, (ex, ey, er) in enumerate(candidates):
+            if np.hypot(px - ex, py - ey) < 15:
+                candidates[i] = (int(round((px + ex) / 2)), int(round((py + ey) / 2)), 9)
+                merged = True
+                break
+        if not merged:
+            candidates.append((px, py, 9))
+
+    # 3. 区分左右半场：左半场为我方 (ours)，右半场为敌方 (enemies)
+    center_x = w / 2.0
+    ours = [c for c in candidates if c[0] <= center_x]
+    enemies = sorted([c for c in candidates if c[0] > center_x], key=lambda c: c[0])
+
+    # 4. 在已确认的我方小兵中查找带红色光晕的 Active Player
+    red1 = cv2.inRange(hsv, (0, 60, 100), (12, 255, 255))
+    red2 = cv2.inRange(hsv, (165, 60, 100), (180, 255, 255))
+    red_mask = cv2.bitwise_or(red1, red2)
+
+    active_circle = None
+    best_red_score = 0
+
+    for c in ours:
+        cx, cy, r = c
+        rx1, ry1 = max(0, cx - 15), max(0, cy - 15)
+        rx2, ry2 = min(w, cx + 16), min(h, cy + 16)
+        red_score = cv2.countNonZero(red_mask[ry1:ry2, rx1:rx2])
+        if red_score > best_red_score and red_score >= 12:
+            best_red_score = red_score
+            active_circle = c
+
+    if active_circle is None:
+        red_clean = cv2.bitwise_and(red_mask, cv2.bitwise_not(obs_mask))
+        rcnts, _ = cv2.findContours(red_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in rcnts:
+            if cv2.contourArea(cnt) < 20:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bw > 34 or bh > 34 or bw / max(1, bh) > 1.45:
+                continue
+            gx, gy = int(round(x + bw / 2.0)), int(round(y + bh / 2.0))
+            if gx <= center_x:
+                patch = gray[max(0, gy - 5):min(h, gy + 6), max(0, gx - 5):min(w, gx + 6)]
+                if patch.size > 0 and np.mean(patch > 240) < 0.45:
+                    active_circle = (gx, gy, 9)
+                    ours.append(active_circle)
+                    break
+
+    if active_circle is None and ours:
+        active_circle = ours[0]
+
+    allies = [
+        c for c in ours
+        if active_circle is None or np.hypot(c[0] - active_circle[0], c[1] - active_circle[1]) >= 8
+    ]
+
+    return ours, allies, enemies, active_circle

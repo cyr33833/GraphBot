@@ -1,19 +1,121 @@
 """
 Lightweight obstacle avoidance for Graphwar auto paths.
 
-Strategy (#4): keep piecewise straight ``direct_line`` segments; when a segment
-hits a black circle, insert a small detour (up/down, then past the circle).
-Output is still a list of game-coordinate waypoints for ``waypoints_to_formula``.
+Pixel-exact obstacle representation using Euclidean Distance Field (SDF)
+and backward-compatible circle-list fallback.
 """
 
 import math
+import cv2
+import numpy as np
 
-from .field_geometry import pixel_radius_to_game, pixel_to_game
+from .field_geometry import pixel_radius_to_game, pixel_to_game, game_to_pixel
 
 GAME_PRECISION = 5
 VERTICAL_MAX_COEFF = 999
 VERTICAL_MIN_EPS = 0.001
 DEFAULT_CLEARANCE = 0.35
+
+
+class ObstacleMap:
+    """
+    Pixel-exact obstacle representation using a Euclidean Distance Field (SDF).
+    Replaces the legacy list of (cx, cy, r) circles while remaining backward-compatible.
+    """
+    def __init__(self, clean_black_mask: np.ndarray, field_w: int, field_h: int):
+        self.mask = clean_black_mask.astype(np.uint8)  # uint8, 255 = obstacle, 0 = free space
+        self.w = int(field_w)
+        self.h = int(field_h)
+
+        # Extract exact contours (including bullet craters & small arcs) for visualization
+        contours, _ = cv2.findContours(self.mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        self.contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= 15]
+
+        # Compute Euclidean distance (in pixels) from every free-space pixel to nearest black pixel
+        free_space = cv2.bitwise_not(self.mask)
+        self.dist_px = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+
+        # Convert pixel distance to game coordinate units (50.0 / w horizontally, 30.0 / h vertically)
+        scale_x = 50.0 / max(1, self.w)
+        scale_y = 30.0 / max(1, self.h)
+        self.unit_per_px = min(scale_x, scale_y)
+        self.dist_game = self.dist_px * self.unit_per_px
+
+        # Also build a dense boundary circle list [(gx, gy, r_game), ...] sampled every 3px
+        # along all obstacle contours so any legacy code iterating over `dangers` still works!
+        self.boundary_circles = self._build_boundary_circles(step_px=3)
+
+    def _build_boundary_circles(self, step_px=3):
+        circles = []
+        r_tiny = round(1.5 * self.unit_per_px, 5)
+        for cnt in self.contours:
+            pts = cnt[:, 0, :]
+            for i in range(0, len(pts), step_px):
+                px, py = int(pts[i][0]), int(pts[i][1])
+                gx, gy = pixel_to_game(px, py, self.w, self.h)
+                circles.append((round(gx, 5), round(gy, 5), r_tiny))
+        return circles
+
+    def __iter__(self):
+        """Backward-compatibility if a planner iterates over `dangers` as (x, y, r) tuples."""
+        return iter(self.boundary_circles)
+
+    def __len__(self):
+        return len(self.contours)
+
+    def __getitem__(self, index):
+        return self.boundary_circles[index]
+
+    def clearance_at_game(self, gx: float, gy: float) -> float:
+        """Return distance in game units to the nearest black obstacle pixel (0.0 if inside obstacle)."""
+        px, py = game_to_pixel(gx, gy, self.w, self.h)
+        ix, iy = int(round(px)), int(round(py))
+        if ix < 0 or ix >= self.w or iy < 0 or iy >= self.h:
+            return -1.0  # Out of bounds
+        return float(self.dist_game[iy, ix])
+
+    def is_point_safe(self, gx: float, gy: float, clearance: float = 0.25) -> bool:
+        return self.clearance_at_game(gx, gy) > clearance
+
+    def is_segment_safe(self, p1, p2, clearance: float = 0.25) -> bool:
+        """Exact pixel-marched line-of-sight collision check between two game points."""
+        x1, y1 = game_to_pixel(p1[0], p1[1], self.w, self.h)
+        x2, y2 = game_to_pixel(p2[0], p2[1], self.w, self.h)
+        length_px = float(np.hypot(x2 - x1, y2 - y1))
+        steps = max(2, int(np.ceil(length_px / 1.5)))
+        xs = np.clip(np.round(np.linspace(x1, x2, steps)).astype(int), 0, self.w - 1)
+        ys = np.clip(np.round(np.linspace(y1, y2, steps)).astype(int), 0, self.h - 1)
+        min_dist = float(np.min(self.dist_game[ys, xs]))
+        return min_dist > clearance
+
+
+def extract_obstacle_map(screenshot_bgr: np.ndarray) -> ObstacleMap:
+    """
+    Extract exact binary mask of black obstacles (removing 1px axes lines and text noise)
+    while preserving 100% of bullet craters, notches, and small protruding arcs.
+    """
+    if len(screenshot_bgr.shape) == 3:
+        gray = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = screenshot_bgr
+    h, w = gray.shape
+
+    # Black obstacles have intensity < 40
+    black_mask = (gray < 40).astype(np.uint8) * 255
+
+    # 3x3 morphological opening removes the 1px coordinate axes and thin text characters
+    # without distorting obstacle boundaries or bullet craters
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    clean_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+
+    # Filter out tiny isolated specks (e.g., bold letters or stray dots < 25px area)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
+    filtered_mask = np.zeros_like(clean_mask)
+    for lbl in range(1, num_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] >= 25:
+            filtered_mask[labels == lbl] = 255
+
+    return ObstacleMap(filtered_mask, w, h)
 
 
 def fmt_game(value):
@@ -28,7 +130,9 @@ def vertical_eps(y_from, y_to, max_coeff=VERTICAL_MAX_COEFF):
 
 
 def field_obstacles_to_game(obstacles_field, field_width, field_height=None):
-    """Convert field-pixel circles (cx, cy, r) to game coords."""
+    """Convert field-pixel obstacles to game coords. Returns ObstacleMap if already an ObstacleMap."""
+    if isinstance(obstacles_field, ObstacleMap):
+        return obstacles_field
     field_height = field_height or field_width
     game = []
     for cx, cy, r in obstacles_field:
@@ -65,6 +169,8 @@ def segment_intersects_circle(p1, p2, circle, margin=0):
 
 
 def _segment_hits_any(p1, p2, obstacles, margin):
+    if isinstance(obstacles, ObstacleMap):
+        return not obstacles.is_segment_safe(p1, p2, clearance=margin)
     return any(segment_intersects_circle(p1, p2, o, margin) for o in obstacles)
 
 

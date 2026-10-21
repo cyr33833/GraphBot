@@ -11,7 +11,7 @@ import time
 
 import cv2
 
-from .avoidance import fmt_game, segment_intersects_circle
+from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
 from .field_geometry import game_to_pixel
 
 X_MIN, X_MAX = -25.0, 25.0
@@ -384,12 +384,17 @@ def evaluate_genome(
             out_of_bounds = True
             break
 
-        for danger in dangers:
-            if segment_intersects_circle(p1, p2, danger, margin=0):
+        if isinstance(dangers, ObstacleMap):
+            if dangers.clearance_at_game(p2[0], p2[1]) <= 0.1:
                 hit_danger = True
                 break
-        if hit_danger:
-            break
+        else:
+            for danger in dangers:
+                if segment_intersects_circle(p1, p2, danger, margin=0):
+                    hit_danger = True
+                    break
+            if hit_danger:
+                break
 
         for enemy_idx, enemy in enumerate(enemies):
             dist = _point_segment_distance(enemy[0], enemy[1], p1[0], p1[1], p2[0], p2[1])

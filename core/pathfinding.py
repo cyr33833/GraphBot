@@ -11,7 +11,7 @@ import math
 
 import cv2
 
-from .avoidance import DEFAULT_CLEARANCE, fmt_game, segment_intersects_circle
+from .avoidance import DEFAULT_CLEARANCE, ObstacleMap, fmt_game, segment_intersects_circle
 from .field_geometry import game_to_pixel
 
 X_MIN, X_MAX = -25.0, 25.0
@@ -50,9 +50,11 @@ def cell_to_game(gi, gj):
 
 
 def _cell_blocked(gi, gj, obstacles, margin):
-    cx, cy = cell_to_game(gi, gj)
+    gx, gy = cell_to_game(gi, gj)
+    if isinstance(obstacles, ObstacleMap):
+        return not obstacles.is_point_safe(gx, gy, clearance=margin)
     for ox, oy, r in obstacles:
-        if math.hypot(cx - ox, cy - oy) <= r + margin:
+        if math.hypot(gx - ox, gy - oy) <= r + margin:
             return True
     return False
 
@@ -91,6 +93,14 @@ def _heuristic(gi, gj, goal_i, goal_j, obstacles, margin):
     tx, ty = cell_to_game(goal_i, goal_j)
     dist = math.hypot(gx - tx, gy - ty)
 
+    if isinstance(obstacles, ObstacleMap):
+        clearance = obstacles.clearance_at_game(gx, gy)
+        pad = margin + 0.4
+        penalty = 0.0
+        if 0 <= clearance < pad:
+            penalty = (pad - clearance) * 1.8
+        return dist + penalty
+
     penalty = 0.0
     for ox, oy, r in obstacles:
         d = math.hypot(gx - ox, gy - oy)
@@ -98,6 +108,12 @@ def _heuristic(gi, gj, goal_i, goal_j, obstacles, margin):
         if d < pad:
             penalty += (pad - d) * 1.8
     return dist + penalty
+
+
+def _segment_hits_any(p1, p2, obstacles, margin):
+    if isinstance(obstacles, ObstacleMap):
+        return not obstacles.is_segment_safe(p1, p2, clearance=margin)
+    return any(segment_intersects_circle(p1, p2, o, margin) for o in obstacles)
 
 
 def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE):
@@ -109,6 +125,16 @@ def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE):
 
     start_i, start_j = game_to_cell(start[0], start[1])
     goal_i, goal_j = game_to_cell(goal[0], goal[1])
+
+    # Unblocking radius around start/goal so characters inside craters/tunnels can be reached
+    if isinstance(obstacles, ObstacleMap):
+        if obstacles.clearance_at_game(start[0], start[1]) > 0.0:
+            blocked[start_i][start_j] = False
+        if obstacles.clearance_at_game(goal[0], goal[1]) > 0.0:
+            blocked[goal_i][goal_j] = False
+    else:
+        blocked[start_i][start_j] = False
+        blocked[goal_i][goal_j] = False
 
     start_free = _nearest_free(start_i, start_j, blocked, prefer_right=False)
     goal_free = _nearest_free(goal_i, goal_j, blocked, prefer_right=False)
@@ -163,10 +189,6 @@ def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE):
     cells.reverse()
 
     return [cell_to_game(gi, gj) for gi, gj in cells]
-
-
-def _segment_hits_any(p1, p2, obstacles, margin):
-    return any(segment_intersects_circle(p1, p2, o, margin) for o in obstacles)
 
 
 def simplify_path(points, obstacles, margin):

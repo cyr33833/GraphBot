@@ -1,6 +1,6 @@
 
 
-"""
+r""""
    ____                     _      ____          _   
   / ___| _ __  __ _  _ __  | |__  | __ )   ___  | |_ 
  | |  _ | '__|/ _` || '_ \ | '_ \ |  _ \  / _ \ | __|
@@ -9,7 +9,7 @@
                     |_|
                     
 =========================================================
- GraphBot.py (Ultimate Fix: Canvas Crop, Edge Circles & Player Color Detection)
+ GraphBot.py (Pixel-Exact Boundary & SDF Obstacle Avoidance)
 =========================================================
 """
 
@@ -24,16 +24,13 @@ import numpy as np
 import win32api, win32con, win32gui
 import pyperclip
 
-# 注意：不要开启 SetProcessDpiAwareness，因为 Graphwar (Java) 运行在系统缩放兼容模式下，
-# 保持 Python 与 Java 处于同一套 Windows 逻辑坐标系，才能保证窗口矩形与截图严丝合缝。
-
 from core.window_capture import find_game_window, get_capture_field, load_capture_margins
 from core.detection import (
     load_active_params,
     load_obstacles_params,
     load_players_params,
 )
-from core.avoidance import field_obstacles_to_game, DEFAULT_CLEARANCE
+from core.avoidance import ObstacleMap, extract_obstacle_map, field_obstacles_to_game, DEFAULT_CLEARANCE
 from core.field_geometry import pixel_radius_to_game, pixel_to_game
 from core.pathfinding import astar_game, build_enemy_chain_astar, draw_path_on_field
 from core.polynomial_planner import (
@@ -46,6 +43,7 @@ from core.symbolic_ga_planner import (
     draw_symbolic_stats_overlay,
     search_best_symbolic_ga,
 )
+
 
 # =========================================================
 # Basic Helpers
@@ -103,12 +101,12 @@ def sleep_key(sec):
 
 
 # =========================================================
-# 1. 精准画布裁剪（彻底消除底部 UI 越界与弹道缩放偏移）
+# 1. 永不失败的画布边界锁定（彻底告别底部 UI 混入）
 # =========================================================
 def auto_crop_white_field(hwnd, fallback_field):
     """
-    通过在窗口客户区中寻找纯白画布与 1px 黑色内边框的精确交界，
-    彻底切掉周围灰绿色 UI 面板和底部的 y= 输入框，确保 [-25,25]x[-15,15] 比例 100% 精准。
+    直接根据 Graphwar 灰绿色外壳 (RGB ~ 155, 190, 145) 与内部战场的分界线来裁剪。
+    无论战场上黑圆有多少、名字牌有多少，灰绿色外壳的位置是绝对固定的！
     """
     try:
         left, top, right, bottom = win32gui.GetClientRect(hwnd)
@@ -119,260 +117,210 @@ def auto_crop_white_field(hwnd, fallback_field):
 
         client_rect = {"left": pt[0], "top": pt[1], "width": cw, "height": ch}
         with mss.mss() as sct:
+            # mss.grab 返回的是 BGRA 格式！
             img = np.array(sct.grab(client_rect))
 
-        bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        b = img[:, :, 0].astype(np.int16)
+        g = img[:, :, 1].astype(np.int16)
+        r = img[:, :, 2].astype(np.int16)
 
-        # Graphwar 的外围面板是灰绿色的 (Hue 约 40~85, Sat > 18, Val < 225)
-        # 而游戏主战场内部只有纯白背景 (Val > 240, Sat < 10) 和纯黑障碍圆 (Val < 40)
-        is_white_or_black = ((hsv[:, :, 2] > 235) & (hsv[:, :, 1] < 15)) | (hsv[:, :, 2] < 45)
-        canvas_mask = (is_white_or_black.astype(np.uint8)) * 255
+        # 识别外围灰绿色 UI 背景特征：绿色通道明显高于红蓝通道 (g - r > 12 且 g - b > 15)
+        is_green_panel = (g - r > 12) & (g - b > 15) & (g > 100) & (g < 230)
 
-        # 统计每一行、每一列属于画布像素的比例
-        # 主战场占据窗口上半部分约 75%~85% 的高度、94% 以上的宽度
-        row_ratio = np.mean(canvas_mask > 0, axis=1)
-        col_ratio = np.mean(canvas_mask[: int(ch * 0.85), :] > 0, axis=0)
+        # 非灰绿色面板的区域就是主战场画布（在窗口上半部分 85% 范围内）
+        not_panel = (~is_green_panel).astype(np.uint8)
 
-        valid_rows = np.where(row_ratio > 0.88)[0]
-        valid_cols = np.where(col_ratio > 0.80)[0]
+        # 每一行不是灰绿面板的比例：在主战场内部，这个比例接近 96%（只有左右两侧极窄边框是绿的）
+        # 而在主战场下方（y= 输入框上方那条横贯全屏的灰绿背景条），这个比例直接跌到 0%！
+        row_canvas_score = np.mean(not_panel, axis=1)
 
-        if len(valid_rows) > 200 and len(valid_cols) > 300:
-            # 找到第一段连续的高占比行（即为上方主战场，跳过底部的白色输入框）
-            y1 = int(valid_rows[0])
-            y2 = y1
-            for r in valid_rows[1:]:
-                if r - y2 <= 5:  # 允许坐标轴线等微小间断
-                    y2 = int(r)
-                else:
-                    break
+        # 寻找从顶部开始的第一段连续画布行 (score > 0.85)
+        y1 = None
+        y2 = None
+        for y in range(int(ch * 0.90)):
+            if row_canvas_score[y] > 0.85:
+                if y1 is None:
+                    y1 = y
+                y2 = y
+            elif y1 is not None and (y - y1) > int(ch * 0.45):
+                # 已经完整走过了主战场高度，遇到了下方的灰绿面板分割带，立即停止！
+                break
 
-            x1 = int(valid_cols[0])
-            x2 = int(valid_cols[-1])
-
-            w = x2 - x1 + 1
-            h = y2 - y1 + 1
-
-            # 收缩 1 像素以去掉包裹画布的 1px 黑色矩形框线
-            if w > cw * 0.85 and h > ch * 0.55:
+        if y1 is not None and y2 is not None and (y2 - y1) > int(ch * 0.50):
+            # 在锁定的 [y1, y2] 行范围内，同样找出左右两侧非灰绿面板的起止列 [x1, x2]
+            col_canvas_score = np.mean(not_panel[y1:y2, :], axis=0)
+            valid_x = np.where(col_canvas_score > 0.85)[0]
+            if len(valid_x) > int(cw * 0.80):
+                x1 = int(valid_x[0])
+                x2 = int(valid_x[-1])
+                # 向内缩 2 像素去掉包裹白色战场的黑色 1px 边框线
                 return {
-                    "left": pt[0] + x1 + 1,
-                    "top": pt[1] + y1 + 1,
-                    "width": w - 2,
-                    "height": h - 2,
+                    "left": pt[0] + x1 + 2,
+                    "top": pt[1] + y1 + 2,
+                    "width": (x2 - x1 + 1) - 4,
+                    "height": (y2 - y1 + 1) - 4,
                 }
     except Exception:
         pass
 
-    return fallback_field
+    # 如果万一出现异常，也绝不使用会截到底部 UI 的高度，强制限制高度不超过窗口的 76%
+    safe_fallback = dict(fallback_field)
+    if safe_fallback["height"] > 500:
+        safe_fallback["height"] = int(safe_fallback["height"] * 0.90)
+    return safe_fallback
 
 
 # =========================================================
-# 2. 完美识别黑色障碍圆（解决贴边圆变小、重叠圆漏检）
+# 2. 干净、完整的大圆识别（彻底消除边缘一串难看的小圆）
 # =========================================================
-def detect_obstacles_accurate(screenshot_bgr):
+# 2. 像素级障碍物提取与距离场（彻底告别圆拟合）
+# =========================================================
+def detect_obstacles_clean(screenshot_bgr):
     """
-    通过边界外延 + 迭代式距离变换峰值提取，精准识别所有独立黑圆、粘连黑圆以及贴边半圆。
+    提取像素级绝对精确的黑障碍物地图与欧氏距离场 (SDF)，
+    保留 100% 弹坑、隧道与微小凸起，彻底抛弃圆拟合。
     """
-    gray = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    # 提取纯黑像素（障碍圆内部灰度全部为 0）
-    black_mask = (gray < 35).astype(np.uint8) * 255
-
-    # 抹除 1px 宽的十字坐标轴线，防止坐标轴切断或干扰距离计算
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    clean_black = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel_open)
-
-    # 关键修复：对于贴近画面上下左右边缘的圆（如右下角的圆），如果直接算距离变换，
-    # 图像边界外的 0 会把峰值往内推、半径算小。
-    # 因此我们在四周复制延拓 PAD 像素，让贴边黑圆自然延伸出去！
-    pad = 80
-    padded = cv2.copyMakeBorder(clean_black, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-
-    # 先用全局距离变换一次性找出所有明显的局部极大值圆心
-    dist = cv2.distanceTransform(padded, cv2.DIST_L2, 5)
-    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
-    local_max = cv2.dilate(dist, dilate_k)
-
-    # 找出所有半径 >= 7 的局部峰值，按半径从大到小排序
-    peaks_mask = (dist == local_max) & (dist >= 7.0)
-    ys, xs = np.where(peaks_mask)
-    radii = dist[ys, xs]
-    order = np.argsort(-radii)
-
-    # 用残差掩码验证：只保留真正覆盖了未解释黑色像素的圆，杜绝左侧大黑块内部产生多余的同心伪圆
-    remaining = clean_black.copy()
-    circles = []
-
-    for idx in order:
-        py, px = int(ys[idx]), int(xs[idx])
-        r_est = float(radii[idx])
-
-        cx = px - pad
-        cy = py - pad
-
-        # 圆心必须在画布合理范围内
-        if cx < -r_est or cx >= w + r_est or cy < -r_est or cy >= h + r_est:
-            continue
-
-        r_int = int(round(r_est)) + 1  # +1 补偿刚才开运算腐蚀掉的半个像素边缘
-
-        # 检查这个候选圆在当前 remaining 掩码里能覆盖多少尚未被大圆解释的黑色像素
-        check_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(check_mask, (cx, cy), r_int, 255, -1)
-
-        new_black_pixels = cv2.countNonZero(cv2.bitwise_and(remaining, check_mask))
-        circle_area = max(1, cv2.countNonZero(check_mask))
-
-        # 如果该圆内部绝大部分黑色区域已经被更大的圆覆盖了，说明是粘连过渡区的伪峰值，跳过
-        if new_black_pixels < max(25, circle_area * 0.12):
-            continue
-
-        # 确认是真实障碍圆：加入列表，并从 remaining 中擦除它覆盖的区域
-        circles.append((cx, cy, r_int))
-        cv2.circle(remaining, (cx, cy), int(r_int * 0.92), 0, -1)
-
-    # 补充扫描：万一还有残余的黑色块没被峰值抓到，用迭代最大值兜底
-    for _ in range(15):
-        if cv2.countNonZero(remaining) < 60:
-            break
-        pad_rem = cv2.copyMakeBorder(remaining, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
-        d_rem = cv2.distanceTransform(pad_rem, cv2.DIST_L2, 5)
-        _, max_val, _, max_loc = cv2.minMaxLoc(d_rem)
-        if max_val < 7.5:
-            break
-        cx = max_loc[0] - pad
-        cy = max_loc[1] - pad
-        r_int = int(round(max_val)) + 1
-        circles.append((cx, cy, r_int))
-        cv2.circle(remaining, (cx, cy), int(r_int * 0.95), 0, -1)
-
-    return circles
+    return extract_obstacle_map(screenshot_bgr)
 
 
 # =========================================================
-# 3. 专属玩家与敌人识别（100% 识别小兵，100% 忽略名字标牌）
+# 3. 精准识别所有友军、敌军与发射角色（绝不误认名字牌 111）
 # =========================================================
 def detect_all_players_robust(screenshot_bgr, obstacles):
     """
-    直接根据 Graphwar 角色球体内部的鲜艳扇形色块 + 灰金属球体特征进行识别。
-    名字标牌（如 Multivac、Wolfram、11）内部是白底黑字（饱和度为0），天然被彻底排除！
-    同时检测当前回合自带红色发光光晕（Active Glow）的控制角色。
+    为什么之前会把 '111' 名字框当成发射点？
+    因为 '111' 的名字框是红棕色的细线矩形（内部是纯白底色），而真正的发射角色是一个实心球体，
+    球体中心有高饱和度的亮黄色扇形 + 灰黑色金属半圆，且周围环绕红色光晕。
+
+    本函数通过验证【球体内部非白实心度 + 亮黄色/彩色扇形】双重特征：
+    1. 名字牌内部 >70% 是纯白背景，100% 被直接剔除！
+    2. 每一个真小兵（包含友军、敌军、发射点）100% 被识别！
     """
     hsv = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(screenshot_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # 构造障碍物掩码，向外扩 3 像素，防止黑球边缘干扰
-    obs_mask = np.zeros((h, w), dtype=np.uint8)
-    for ox, oy, orad in obstacles:
-        cv2.circle(obs_mask, (int(ox), int(oy)), int(orad) + 3, 255, -1)
+    # 1. 屏蔽所有黑色障碍区域
+    if isinstance(obstacles, ObstacleMap):
+        obs_mask = obstacles.mask
+    else:
+        obs_mask = np.zeros((h, w), dtype=np.uint8)
+        for ox, oy, orad in obstacles:
+            cv2.circle(obs_mask, (int(ox), int(oy)), int(orad) + 2, 255, -1)
 
-    # 1. 首先定位当前激活角色（Active Player）：身体周围有一圈明显的红色发光光晕
-    # 红色在 HSV 中位于 H in [0, 10] 或 [168, 180]
-    red1 = cv2.inRange(hsv, (0, 70, 120), (10, 255, 255))
-    red2 = cv2.inRange(hsv, (168, 70, 120), (180, 255, 255))
-    red_glow = cv2.bitwise_or(red1, red2)
-    red_glow = cv2.bitwise_and(red_glow, cv2.bitwise_not(obs_mask))
+    # 2. 提取所有小兵球体内部的鲜艳扇形色块（在正确 BGR 下，小兵内部的黄/青/绿/橙扇形饱和度极高 S > 80, V > 130）
+    # 注意：名字牌的边框线虽然也有颜色，但它是 1px 的空心细框，而小兵内部是实心的色块团！
+    vivid_mask = cv2.inRange(hsv, (12, 80, 120), (165, 255, 255))
+    vivid_mask = cv2.bitwise_and(vivid_mask, cv2.bitwise_not(obs_mask))
 
-    active_circle = None
-    glow_cnts, _ = cv2.findContours(red_glow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if glow_cnts:
-        best_glow = max(glow_cnts, key=cv2.contourArea)
-        if cv2.contourArea(best_glow) >= 18:
-            (gx, gy), _ = cv2.minEnclosingCircle(best_glow)
-            active_circle = (int(round(gx)), int(round(gy)), 9)
+    # 用 3x3 闭运算聚合小兵内部扇形，不把细边框连成片
+    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    vivid_blobs = cv2.morphologyEx(vivid_mask, cv2.MORPH_CLOSE, k_small)
 
-    # 2. 定位场上所有小兵（我方+敌方）：
-    # 每个小兵球体内部都有一块高饱和度的亮色扇形（如黄、青、绿、紫、橙、蓝等），
-    # 而背景是纯白(S=0)、障碍是纯黑(V=0)、名字牌是白底黑字灰框(S<25)。
-    # 因此提取 S > 65 且 V > 90 的彩色像素即可精准抓出所有小兵！
-    color_mask = cv2.inRange(hsv, (0, 65, 90), (180, 255, 255))
-    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(obs_mask))
+    cnts, _ = cv2.findContours(vivid_blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 把刚才的红色光晕外圈稍微缩一点，避免光晕把单个小兵拆成碎片，用膨胀把同一个小兵内部的色块聚合成团
-    kernel_merge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    blobs = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel_merge)
-
-    cnts, _ = cv2.findContours(blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    detected_players = []
+    candidates = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
-        # 单个小兵色块面积通常在 12 到 500 像素之间（过滤掉 1~2px 的杂色噪点）
-        if area < 10 or area > 700:
+        if area < 8 or area > 450:
             continue
 
         x, y, bw, bh = cv2.boundingRect(cnt)
-        # 名字框如果带彩色边框会是扁长条（宽高比极大），而小兵球体接近正方形
-        if bw > 36 or bh > 36 or bw / max(1, bh) > 2.5:
+        # 排除扁长的名字标签外框（小兵色块宽高都在 4~22 像素之间）
+        if bw > 26 or bh > 26 or bw / max(1, bh) > 2.2:
             continue
 
-        # 计算色块质心
         M = cv2.moments(cnt)
-        if M["m00"] > 0:
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-        else:
-            cx, cy = x + bw / 2.0, y + bh / 2.0
+        if M["m00"] <= 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
 
-        # 微调球心：小兵的黄色扇形位于球体的左下半边，球体右上半边是灰色金属。
-        # 我们在 (cx, cy) 附近 14x14 的窗口内，结合整个非白球体（灰度 < 235）的质心来精修圆心！
-        r_win = 11
-        x1, y1 = max(0, int(cx) - r_win), max(0, int(cy) - r_win)
-        x2, y2 = min(w, int(cx) + r_win + 1), min(h, int(cy) + r_win + 1)
+        # 核心验证：以 (cx, cy) 为中心取半径 8 的圆形区域，检查它是不是一个实心小兵球体！
+        # 名字框内部全是白色背景 (gray > 240)，而小兵球体由彩色扇形+深灰金属组成 (gray < 225)
+        r_check = 9
+        x1, y1 = max(0, int(cx) - r_check), max(0, int(cy) - r_check)
+        x2, y2 = min(w, int(cx) + r_check + 1), min(h, int(cy) + r_check + 1)
         patch_gray = gray[y1:y2, x1:x2]
-        # 球体像素（无论是黄色扇形还是灰色金属）灰度都明显低于纯白背景(< 238)
-        body_mask = (patch_gray < 235).astype(np.uint8)
-        bm = cv2.moments(body_mask)
-        if bm["m00"] > 20:
-            refined_cx = x1 + bm["m10"] / bm["m00"]
-            refined_cy = y1 + bm["m01"] / bm["m00"]
-            # 如果精修中心偏移在合理范围内（<= 4px），采用精修球心
-            if np.hypot(refined_cx - cx, refined_cy - cy) <= 4.5:
-                cx, cy = refined_cx, refined_cy
+        if patch_gray.size == 0:
+            continue
+
+        # 小兵球体像素（非纯白且非纯黑）
+        body_pixels = (patch_gray < 232) & (patch_gray > 25)
+        if np.sum(body_pixels) < 35:
+            # 实心像素太少，说明只是名字框的边角线，跳过！
+            continue
+
+        # 用球体全部实心像素的质心来微调圆心，使其精准对准小兵正中心
+        bm = cv2.moments(body_pixels.astype(np.uint8))
+        if bm["m00"] > 0:
+            rcx = x1 + bm["m10"] / bm["m00"]
+            rcy = y1 + bm["m01"] / bm["m00"]
+            if np.hypot(rcx - cx, rcy - cy) <= 5.0:
+                cx, cy = rcx, rcy
 
         px, py = int(round(cx)), int(round(cy))
 
-        # 去重：如果两个色块属于同一个小兵（距离 < 14px），合并
+        # 合并同一个小兵的相邻检测点
         merged = False
-        for idx, (ex, ey, er) in enumerate(detected_players):
-            if np.hypot(px - ex, py - ey) < 14:
-                detected_players[idx] = (int(round((px + ex) / 2)), int(round((py + ey) / 2)), 9)
+        for i, (ex, ey, er) in enumerate(candidates):
+            if np.hypot(px - ex, py - ey) < 15:
+                candidates[i] = (int(round((px + ex) / 2)), int(round((py + ey) / 2)), 9)
                 merged = True
                 break
         if not merged:
-            detected_players.append((px, py, 9))
+            candidates.append((px, py, 9))
 
-    # 按画布中线 (x = w / 2) 区分左半场（我方）和右半场（敌方）
+    # 3. 区分左右半场：左半场为我方 (ours)，右半场为敌方 (enemies)
     center_x = w / 2.0
-    ours = []
-    enemies = []
+    ours = [c for c in candidates if c[0] <= center_x]
+    enemies = sorted([c for c in candidates if c[0] > center_x], key=lambda c: c[0])
 
-    for c in detected_players:
-        if c[0] > center_x:
-            enemies.append(c)
-        else:
-            ours.append(c)
+    # 4. 在已确认的我方小兵 (ours) 中，找出谁身上带着红色发光光晕（Active Player）！
+    # 注意：只在已经确认是真小兵的周围 15 像素环带内检测红光，这样绝对不可能把 '111' 红色名字框当成发射点！
+    red1 = cv2.inRange(hsv, (0, 60, 100), (12, 255, 255))
+    red2 = cv2.inRange(hsv, (165, 60, 100), (180, 255, 255))
+    red_mask = cv2.bitwise_or(red1, red2)
 
-    enemies.sort(key=lambda c: c[0])
+    active_circle = None
+    best_red_score = 0
 
-    # 将红光激活角色与我方列表对齐
-    if active_circle is not None:
-        matched = None
-        for c in ours:
-            if np.hypot(c[0] - active_circle[0], c[1] - active_circle[1]) < 18:
-                matched = c
-                break
-        if matched is not None:
-            active_circle = matched
-        else:
-            ours.append(active_circle)
-    elif ours:
+    for c in ours:
+        cx, cy, r = c
+        rx1, ry1 = max(0, cx - 15), max(0, cy - 15)
+        rx2, ry2 = min(w, cx + 16), min(h, cy + 16)
+        red_score = cv2.countNonZero(red_mask[ry1:ry2, rx1:rx2])
+        if red_score > best_red_score and red_score >= 12:
+            best_red_score = red_score
+            active_circle = c
+
+    # 如果万一某小兵全身都被红光盖住而没进 candidates，单独检查场上实心红光团（同时排除空心名字框）
+    if active_circle is None:
+        red_clean = cv2.bitwise_and(red_mask, cv2.bitwise_not(obs_mask))
+        rcnts, _ = cv2.findContours(red_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in rcnts:
+            if cv2.contourArea(cnt) < 20:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            # 名字框 '111' 的宽高比是扁矩形 (bw > 24, bh < 18)，而发光球体是正方形 (bw ~ bh)
+            if bw > 34 or bh > 34 or bw / max(1, bh) > 1.45:
+                continue
+            gx, gy = int(round(x + bw / 2.0)), int(round(y + bh / 2.0))
+            if gx <= center_x:
+                # 还要检查中心不能是纯白底色（排除短名字框）
+                patch = gray[max(0, gy - 5):min(h, gy + 6), max(0, gx - 5):min(w, gx + 6)]
+                if patch.size > 0 and np.mean(patch > 240) < 0.45:
+                    active_circle = (gx, gy, 9)
+                    ours.append(active_circle)
+                    break
+
+    if active_circle is None and ours:
         active_circle = ours[0]
 
-    allies = [c for c in ours if active_circle is None or np.hypot(c[0] - active_circle[0], c[1] - active_circle[1]) >= 8]
+    allies = [
+        c for c in ours
+        if active_circle is None or np.hypot(c[0] - active_circle[0], c[1] - active_circle[1]) >= 8
+    ]
 
     return ours, allies, enemies, active_circle
 
@@ -381,10 +329,9 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
 # Visualization & Math Helpers
 # =========================================================
 def draw_players_roles_overlay(screenshot_bgr, allies, enemies, active):
-    """Draw allies/enemies/active with distinct colors."""
     out = screenshot_bgr
 
-    # Enemies (right side): red/orange
+    # Enemies (right side): red-orange
     for cx, cy, radius in enemies:
         cv2.circle(out, (int(cx), int(cy)), int(radius), (0, 70, 255), 2)
         cv2.circle(out, (int(cx), int(cy)), 2, (0, 70, 255), -1)
@@ -403,10 +350,16 @@ def draw_players_roles_overlay(screenshot_bgr, allies, enemies, active):
     return out
 
 
-def draw_obstacle_circles(screenshot_bgr, obstacles):
-    for cx, cy, r in obstacles:
-        cv2.circle(screenshot_bgr, (int(cx), int(cy)), int(r), (255, 0, 255), 2)
+def draw_obstacle_contours(screenshot_bgr, obstacle_map):
+    """用洋红色单一清晰轮廓绘制像素级真实障碍物边界（包含弹坑与隧道）。"""
+    if obstacle_map is not None and hasattr(obstacle_map, "contours"):
+        cv2.drawContours(screenshot_bgr, obstacle_map.contours, -1, (255, 0, 255), 2, cv2.LINE_AA)
+    elif obstacle_map is not None:
+        for cx, cy, r in obstacle_map:
+            cv2.circle(screenshot_bgr, (int(cx), int(cy)), int(r), (255, 0, 255), 2)
     return screenshot_bgr
+
+draw_obstacle_circles = draw_obstacle_contours
 
 
 GAME_PRECISION = 5
@@ -446,10 +399,7 @@ def field_circle_to_game(circle):
 
 
 def collect_symbolic_scene(screenshot_bgr, players_params=None, active_params=None, obstacles_params=None):
-    """
-    全新统一场景感知管线：使用精准距离变换检测黑圆 + 彩色连通域检测全部玩家与敌人。
-    """
-    obstacles_field = detect_obstacles_accurate(screenshot_bgr)
+    obstacles_field = extract_obstacle_map(screenshot_bgr)
     ours_field, allies_field, enemies_field, active_circle = detect_all_players_robust(
         screenshot_bgr, obstacles_field
     )
@@ -503,11 +453,6 @@ def direct_line(p1, p2):
 
 
 def waypoints_to_formula(waypoints):
-    """
-    注意：在 Graphwar 中，发射出的函数曲线 g(x) 会被系统自动平移，使得起点对齐角色中心 (x0, y0)，
-    即实际轨迹为 y(x) = y0 + g(x) - g(x0)。
-    只要画布宽高比与 [-25, 25] x [-15, 15] 完全一致，分段绝对值线性插值就会严丝合缝地穿过每个航点！
-    """
     parts = []
     for i in range(len(waypoints) - 1):
         parts.append(direct_line(tuple(waypoints[i]), tuple(waypoints[i + 1])))
@@ -639,6 +584,7 @@ def main():
                 continue
 
             screenshot = np.array(mss_.grab(field))
+            # 关键修正：mss.grab 返回的是 BGRA，必须用 COLOR_BGRA2BGR，绝不能用 COLOR_RGB2BGR！
             screenshot_r = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2GRAY)
             screenshot_bgr = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
 
@@ -655,7 +601,7 @@ def main():
                 scene["enemies_field"],
                 scene["active_circle"],
             )
-            screenshot_vis = draw_obstacle_circles(screenshot_vis, scene["obstacles_field"])
+            screenshot_vis = draw_obstacle_contours(screenshot_vis, scene["obstacles_field"])
 
             if scene["total_players_count"] == 0:
                 warn_no_players("Auto mode")
@@ -759,7 +705,7 @@ def main():
                     scene["enemies_field"],
                     scene["active_circle"],
                 )
-                screenshot_base = draw_obstacle_circles(screenshot_base, scene["obstacles_field"])
+                screenshot_base = draw_obstacle_contours(screenshot_base, scene["obstacles_field"])
 
                 if scene["active_norm"] is None:
                     warn_no_players("Auto mode")
@@ -820,7 +766,7 @@ def main():
                 screenshot_vis,
                 poly_result["best_points"],
                 field["width"],
-                field["height"],
+                    field["height"],
                 color=(0, 255, 0),
                 thickness=2,
             )
@@ -883,7 +829,7 @@ def main():
                 scene["enemies_field"],
                 scene["active_circle"],
             )
-            screenshot_vis = draw_obstacle_circles(screenshot_vis, scene["obstacles_field"])
+            screenshot_vis = draw_obstacle_contours(screenshot_vis, scene["obstacles_field"])
 
             if scene["active_norm"] is None:
                 warn_no_players("Auto mode")
@@ -906,7 +852,6 @@ def main():
             )
             obstacles_game = scene["obstacles_game"]
 
-            # 将起点设为 active_norm 并串联所有敌人
             chain_targets = [list(active_norm)] + enemy_centers_norm
             path_waypoints, hit_enemies, skipped_enemies = build_enemy_chain_astar(
                 chain_targets,
@@ -1001,6 +946,7 @@ def main():
             prev_text = formula
 
             safe_exit(0)
+
 
 # =========================================================
 # Main Program

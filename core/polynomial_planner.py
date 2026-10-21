@@ -13,7 +13,7 @@ import time
 import cv2
 import numpy as np
 
-from .avoidance import fmt_game, segment_intersects_circle
+from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
 from .field_geometry import game_to_pixel
 
 X_MIN, X_MAX = -25.0, 25.0
@@ -172,17 +172,21 @@ def evaluate_polynomial(
             victory_reached = True
             break
 
-        # TEMP DEBUG (requested): bounds and danger checks are disabled.
-        # if _segment_out_of_bounds(p1, p2, bounds):
-        #     out_of_bounds = True
-        #     break
-        #
-        # for danger in dangers:
-        #     if segment_intersects_circle(p1, p2, danger, margin=0):
-        #         hit_danger = True
-        #         break
-        # if hit_danger:
-        #     break
+        if _segment_out_of_bounds(p1, p2, bounds):
+            out_of_bounds = True
+            break
+
+        if isinstance(dangers, ObstacleMap):
+            if dangers.clearance_at_game(p2[0], p2[1]) <= 0.1:
+                hit_danger = True
+                break
+        else:
+            for danger in dangers:
+                if segment_intersects_circle(p1, p2, danger, margin=0):
+                    hit_danger = True
+                    break
+            if hit_danger:
+                break
 
         for ally_idx, ally in enumerate(allies):
             if ally_idx in hit_ally_ids:

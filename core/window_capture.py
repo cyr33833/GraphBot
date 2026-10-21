@@ -6,6 +6,9 @@ import ctypes
 import json
 from pathlib import Path
 
+import cv2
+import mss
+import numpy as np
 import win32gui
 
 DEFAULT_GAME_WINDOW_NAME = "Graphwar"
@@ -100,3 +103,53 @@ def get_capture_field(hwnd, margins=None):
         "width": width,
         "height": height,
     }
+
+
+def auto_crop_white_field(hwnd, fallback_field):
+    """
+    Lock onto the interior white battle canvas bounded by the 1px black border,
+    completely excluding the outer greenish-gray Java UI panel (g - r > 12 and g - b > 15).
+    """
+    try:
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        pt = win32gui.ClientToScreen(hwnd, (0, 0))
+        cw, ch = right - left, bottom - top
+        if cw <= 200 or ch <= 200:
+            return fallback_field
+
+        client_rect = {"left": pt[0], "top": pt[1], "width": cw, "height": ch}
+        with mss.mss() as sct:
+            img = np.array(sct.grab(client_rect))
+
+        b = img[:, :, 0].astype(np.int16)
+        g = img[:, :, 1].astype(np.int16)
+        r = img[:, :, 2].astype(np.int16)
+
+        # Outer Graphwar UI panel is greenish-gray
+        is_green_panel = (g - r > 12) & (g - b > 15) & (g > 100) & (g < 230)
+        not_panel = (~is_green_panel).astype(np.uint8)
+        row_canvas_score = np.mean(not_panel, axis=1)
+
+        y1, y2 = None, None
+        for y in range(int(ch * 0.90)):
+            if row_canvas_score[y] > 0.85:
+                if y1 is None:
+                    y1 = y
+                y2 = y
+            elif y1 is not None and (y - y1) > int(ch * 0.45):
+                break
+
+        if y1 is not None and y2 is not None and (y2 - y1) > int(ch * 0.50):
+            col_canvas_score = np.mean(not_panel[y1:y2, :], axis=0)
+            valid_x = np.where(col_canvas_score > 0.85)[0]
+            if len(valid_x) > int(cw * 0.80):
+                x1, x2 = int(valid_x[0]), int(valid_x[-1])
+                return {
+                    "left": pt[0] + x1 + 2,
+                    "top": pt[1] + y1 + 2,
+                    "width": (x2 - x1 + 1) - 4,
+                    "height": (y2 - y1 + 1) - 4,
+                }
+    except Exception:
+        pass
+    return fallback_field
