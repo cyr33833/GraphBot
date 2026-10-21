@@ -36,9 +36,8 @@ class ObstacleMap:
         self.dist_px = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
 
         # Convert pixel distance to game coordinate units (50.0 / w horizontally, 30.0 / h vertically)
-        scale_x = 50.0 / max(1, self.w)
-        scale_y = 30.0 / max(1, self.h)
-        self.unit_per_px = min(scale_x, scale_y)
+        # Isotropic scale (Graphwar Java AWT): 1 game unit on y == 1 game unit on x
+        self.unit_per_px = 50.0 / max(1, self.w)
         self.dist_game = self.dist_px * self.unit_per_px
 
         # Also build a dense boundary circle list [(gx, gy, r_game), ...] sampled every 3px
@@ -238,7 +237,7 @@ def _detour_step(p1, circle, obstacles, margin, clearance, y_bounds):
     return min(candidates, key=_path_length)[1:]
 
 
-def resolve_segment(p1, p2, obstacles, margin=0, clearance=DEFAULT_CLEARANCE, y_bounds=(-15, 15)):
+def resolve_segment(p1, p2, obstacles, margin=0, clearance=DEFAULT_CLEARANCE, y_bounds=(-14.61, 14.61)):
     """
     Return intermediate waypoints (excluding p1, including p2) to reach p2 from p1
     without crossing obstacles. None if no detour found within iteration budget.
@@ -284,7 +283,7 @@ def build_enemy_chain(
     obstacles,
     margin=0,
     clearance=DEFAULT_CLEARANCE,
-    y_bounds=(-15, 15),
+    y_bounds=(-14.61, 14.61),
 ):
     """
     Build formula waypoints enemy-to-enemy. First enemy = formula anchor
@@ -323,7 +322,7 @@ def build_greedy_enemy_path(
     obstacles,
     margin=0,
     clearance=DEFAULT_CLEARANCE,
-    y_bounds=(-15, 15),
+    y_bounds=(-14.61, 14.61),
 ):
     """Legacy planner from active — use build_enemy_chain for formula output."""
     if not enemies:

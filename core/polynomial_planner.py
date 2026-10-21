@@ -14,10 +14,7 @@ import cv2
 import numpy as np
 
 from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
-from .field_geometry import game_to_pixel
-
-X_MIN, X_MAX = -25.0, 25.0
-Y_MIN, Y_MAX = -15.0, 15.0
+from .field_geometry import game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
 
 # More expressive than debug mode, still numerically stable with dx in [0..1].
 COEFS_COUNT = 16

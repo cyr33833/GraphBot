@@ -12,10 +12,7 @@ import time
 import cv2
 
 from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
-from .field_geometry import game_to_pixel
-
-X_MIN, X_MAX = -25.0, 25.0
-Y_MIN, Y_MAX = -15.0, 15.0
+from .field_geometry import game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
 
 REJECT_SCORE = -1_000_000_000.0
 
