@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
-from .field_geometry import game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
+from .field_geometry import format_number, game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
 
 # More expressive than debug mode, still numerically stable with dx in [0..1].
 COEFS_COUNT = 16
@@ -47,7 +47,8 @@ def _clip_coeffs(coeffs, count=COEFS_COUNT):
     out = []
     for idx, coeff in enumerate(coeffs):
         limit = _coeff_limit(idx + 1)
-        out.append(max(-limit, min(limit, coeff)))
+        clipped = max(-limit, min(limit, coeff))
+        out.append(fmt_game(clipped))
     return tuple(out)
 
 
@@ -174,7 +175,7 @@ def evaluate_polynomial(
             break
 
         if isinstance(dangers, ObstacleMap):
-            if dangers.clearance_at_game(p2[0], p2[1]) <= 0.1:
+            if not dangers.is_segment_safe(p1, p2, clearance=0.06):
                 hit_danger = True
                 break
         else:
@@ -288,16 +289,20 @@ def _build_train_points(rng, x0, y0, enemies, dangers, support_indices):
 
 
 def polynomial_to_graphwar_formula(x0, y0, coeffs):
-    x0 = fmt_game(x0)
-    y0 = fmt_game(y0)
-    rounded = [fmt_game(c) for c in coeffs]
-    scale = fmt_game(x_scale_for_shot(x0))
-    u_term = f"(2*(x + {abs(x0)})/{scale} - 1)" if x0 < 0 else f"(2*(x - {x0})/{scale} - 1)"
+    x0_val = fmt_game(x0)
+    y0_str = format_number(y0)
+    scale_str = format_number(x_scale_for_shot(x0_val))
+    x0_abs_str = format_number(abs(x0_val))
+    u_term = f"(2*(x + {x0_abs_str})/{scale_str} - 1)" if x0_val < 0 else f"(2*(x - {x0_abs_str})/{scale_str} - 1)"
     u0 = -1
 
-    parts = [f"{y0}"]
-    for power, coeff in enumerate(rounded, start=1):
-        parts.append(f"({coeff})*(({u_term})^{power} - ({u0})^{power})")
+    parts = [f"{y0_str}"]
+    for power, coeff in enumerate(coeffs, start=1):
+        c_val = fmt_game(coeff)
+        if abs(c_val) < 1e-9:
+            continue
+        c_str = format_number(c_val)
+        parts.append(f"({c_str})*(({u_term})^{power} - ({u0})^{power})")
     return " + ".join(parts).replace("+ (-", "- (")
 
 
@@ -315,6 +320,8 @@ def search_best_polynomial(
 ):
     rng = rng or random.Random()
     started = time.perf_counter()
+    x0 = fmt_game(x0)
+    y0 = fmt_game(y0)
 
     best_coeffs = _normalize_coeffs(prev_best, count=COEFS_COUNT)
     best_eval = None
@@ -328,21 +335,38 @@ def search_best_polynomial(
     ally_penalty_hits = 0
     cap_count = 9999
 
-    if (time.perf_counter() - started) * 1000.0 < budget_ms:
-        support_indices = tuple(range(len(enemies)))
-        train_points = _build_train_points(rng, x0, y0, enemies, dangers, support_indices)
+    while evals < max_evals and (time.perf_counter() - started) * 1000.0 < budget_ms:
+        if evals == 0:
+            support_indices = tuple(range(len(enemies)))
+            train_points = _build_train_points(rng, x0, y0, enemies, dangers, support_indices)
+            reg = 1e-6
+        else:
+            if enemies:
+                k = rng.randint(1, len(enemies))
+                support_indices = tuple(sorted(rng.sample(range(len(enemies)), k)))
+            else:
+                support_indices = ()
+            train_points = _build_train_points(rng, x0, y0, enemies, dangers, support_indices)
+            for _ in range(rng.randint(1, 2)):
+                wx = rng.uniform(float(x0) + 1.0, X_MAX - 0.5)
+                wy = rng.uniform(Y_MIN + 1.5, Y_MAX - 1.5)
+                if isinstance(dangers, ObstacleMap) and not dangers.is_point_safe(wx, wy, clearance=0.45):
+                    continue
+                train_points.append((wx, wy, rng.uniform(1.5, 6.0)))
+            reg = 10.0 ** rng.uniform(-6.0, -1.5)
+
         coeffs, _ = _fit_polynomial_closed_form(
             x0=x0,
             y0=y0,
             train_points=train_points,
             rng=rng,
             coeff_count=COEFS_COUNT,
-            reg_l2=1e-6,
+            reg_l2=reg,
         )
 
         result = evaluate_polynomial(coeffs, x0, y0, enemies, dangers, allies, step=step)
         current_eval = result
-        evals = 1
+        evals += 1
 
         if result["hit_danger"] and rejects_danger < cap_count:
             rejects_danger += 1
@@ -355,8 +379,8 @@ def search_best_polynomial(
             best_coeffs = coeffs
             best_eval = result
 
-    # Refinement on all enemies intentionally disabled for now:
-    # it tends to pull curve into compromise trajectories.
+        if best_eval["valid"] and len(best_eval["hit_enemy_ids"]) == len(enemies) and best_eval["ally_hits"] == 0:
+            break
 
     if best_eval is None:
         best_coeffs = best_coeffs or (0.0,) * COEFS_COUNT

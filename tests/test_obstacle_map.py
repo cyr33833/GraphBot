@@ -74,9 +74,22 @@ class TestObstacleMap(unittest.TestCase):
         enemies = [(12.0, 0.0, 0.6)]
         poly_res = search_best_polynomial(-15.0, 0.0, enemies, self.obs_map, [], budget_ms=40)
         self.assertIn("formula", poly_res)
+        self.assertNotIn("e-", poly_res["formula"].lower())
 
         sym_res = search_best_symbolic_ga(-15.0, 0.0, enemies, self.obs_map, [], budget_ms=40)
         self.assertIn("formula", sym_res)
+        self.assertNotIn("e-", sym_res["formula"].lower())
+
+    def test_scrub_players_removes_soldier_dark_pixels(self):
+        img = np.full((450, 770, 3), 255, dtype=np.uint8)
+        # Draw a dark soldier helmet blob (area ~ 60px) at (150, 225)
+        cv2.circle(img, (150, 222), 5, (10, 10, 10), -1)
+        obs = extract_obstacle_map(img)
+        self.assertLess(obs.clearance_at_game(-15.26, 0.0), 0.2)
+
+        obs.scrub_players([(150, 225, 7)])
+        self.assertGreater(obs.clearance_at_game(-15.26, 0.0), 5.0)
+        self.assertEqual(len(obs.contours), 0)
 
 
 if __name__ == "__main__":

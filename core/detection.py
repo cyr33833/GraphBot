@@ -1,4 +1,3 @@
-from .avoidance import ObstacleMap, extract_obstacle_map
 """
 Player detection helpers for GraphBot.
 
@@ -13,6 +12,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from .avoidance import ObstacleMap, extract_obstacle_map
+from .field_geometry import soldier_radius_px
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -553,7 +555,7 @@ def refine_active_center(bgr, glow_mask, active, glow_center, params=None):
 
     height, width = bgr.shape[:2]
     uncertainty_x = uncertainty_px * 50.0 / max(1, width)
-    uncertainty_y = uncertainty_px * 30.0 / max(1, height)
+    uncertainty_y = uncertainty_px * 50.0 / max(1, width)
     review_limit = float(params["review_uncertainty_game"])
     needs_review = (
         confidence < 0.65
@@ -711,7 +713,7 @@ def find_active_player(bgr, field_width, active_params=None, players_params=None
             "uncertainty_px": max(0.45, 1.5 - score),
             "uncertainty_game": {
                 "x": max(0.45, 1.5 - score) * 50.0 / max(1, bgr.shape[1]),
-                "y": max(0.45, 1.5 - score) * 30.0 / max(1, bgr.shape[0]),
+                "y": max(0.45, 1.5 - score) * 50.0 / max(1, bgr.shape[1]),
             },
             "confidence": confidence,
             "needs_review": confidence < 0.75,
@@ -1330,6 +1332,7 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
 
     cnts, _ = cv2.findContours(vivid_blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    r_soldier = soldier_radius_px(w)
     candidates = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
@@ -1370,11 +1373,11 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
         merged = False
         for i, (ex, ey, er) in enumerate(candidates):
             if np.hypot(px - ex, py - ey) < 15:
-                candidates[i] = (int(round((px + ex) / 2)), int(round((py + ey) / 2)), 9)
+                candidates[i] = (int(round((px + ex) / 2)), int(round((py + ey) / 2)), r_soldier)
                 merged = True
                 break
         if not merged:
-            candidates.append((px, py, 9))
+            candidates.append((px, py, r_soldier))
 
     # 3. 区分左右半场：左半场为我方 (ours)，右半场为敌方 (enemies)
     center_x = w / 2.0
@@ -1387,15 +1390,21 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
     red_mask = cv2.bitwise_or(red1, red2)
 
     active_circle = None
-    best_red_score = 0
+    best_red_score = 0.0
 
     for c in ours:
         cx, cy, r = c
         rx1, ry1 = max(0, cx - 15), max(0, cy - 15)
         rx2, ry2 = min(w, cx + 16), min(h, cy + 16)
-        red_score = cv2.countNonZero(red_mask[ry1:ry2, rx1:rx2])
-        if red_score > best_red_score and red_score >= 12:
-            best_red_score = red_score
+        roi_red = red_mask[ry1:ry2, rx1:rx2]
+        raw_red = cv2.countNonZero(roi_red)
+        if raw_red < 12:
+            continue
+        # 真正の発射红圈环绕小兵上下左右，而头顶红色名字牌只存在于小兵上方 (y < cy - 5)
+        lower_red = cv2.countNonZero(red_mask[min(h, max(0, cy)):ry2, rx1:rx2])
+        score = float(raw_red) * (1.5 if lower_red >= 3 else 0.35)
+        if score > best_red_score:
+            best_red_score = score
             active_circle = c
 
     if active_circle is None:
@@ -1411,7 +1420,7 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
             if gx <= center_x:
                 patch = gray[max(0, gy - 5):min(h, gy + 6), max(0, gx - 5):min(w, gx + 6)]
                 if patch.size > 0 and np.mean(patch > 240) < 0.45:
-                    active_circle = (gx, gy, 9)
+                    active_circle = (gx, gy, r_soldier)
                     ours.append(active_circle)
                     break
 
@@ -1422,5 +1431,9 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
         c for c in ours
         if active_circle is None or np.hypot(c[0] - active_circle[0], c[1] - active_circle[1]) >= 8
     ]
+
+    # 5. 从障碍物掩码中清除所有已识别小兵身上的深色金属帽檐/黑边像素，防止把小兵当成障碍物
+    if isinstance(obstacles, ObstacleMap):
+        obstacles.scrub_players(ours + enemies)
 
     return ours, allies, enemies, active_circle

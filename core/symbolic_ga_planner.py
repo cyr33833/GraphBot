@@ -12,7 +12,7 @@ import time
 import cv2
 
 from .avoidance import ObstacleMap, fmt_game, segment_intersects_circle
-from .field_geometry import game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
+from .field_geometry import format_number, game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
 
 REJECT_SCORE = -1_000_000_000.0
 
@@ -27,7 +27,7 @@ UNARY_OPS = ("sqrt", "log", "ln", "abs", "sin", "cos", "tan", "exp")
 
 
 def _const_node(value):
-    return ("const", float(value))
+    return ("const", fmt_game(value))
 
 
 def _var_node():
@@ -252,10 +252,7 @@ def crossover(parent_a, parent_b, rng):
 
 
 def _format_number(value):
-    rounded = fmt_game(value)
-    if abs(rounded) < 1e-9:
-        rounded = 0.0
-    return str(rounded)
+    return format_number(value)
 
 
 def expression_to_formula(node):
@@ -382,7 +379,7 @@ def evaluate_genome(
             break
 
         if isinstance(dangers, ObstacleMap):
-            if dangers.clearance_at_game(p2[0], p2[1]) <= 0.1:
+            if not dangers.is_segment_safe(p1, p2, clearance=0.06):
                 hit_danger = True
                 break
         else:

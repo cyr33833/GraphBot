@@ -18,9 +18,11 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "capture_config.json"
 DEFAULT_MARGINS = {
     "margin_left": 15,
     "margin_top": 15,
-    "margin_right": 16,
+    "margin_right": 15,
     "margin_bottom": 135,
 }
+
+_CROP_CACHE = {}
 
 
 def _set_process_dpi_awareness():
@@ -105,7 +107,7 @@ def get_capture_field(hwnd, margins=None):
     }
 
 
-def auto_crop_white_field(hwnd, fallback_field):
+def auto_crop_white_field(hwnd, fallback_field, use_cache=True):
     """
     Lock onto the interior white battle canvas bounded by the 1px black border,
     completely excluding the outer greenish-gray Java UI panel (g - r > 12 and g - b > 15).
@@ -116,6 +118,16 @@ def auto_crop_white_field(hwnd, fallback_field):
         cw, ch = right - left, bottom - top
         if cw <= 200 or ch <= 200:
             return fallback_field
+
+        cache_key = (int(hwnd), cw, ch)
+        if use_cache and cache_key in _CROP_CACHE:
+            rel_x, rel_y, w, h = _CROP_CACHE[cache_key]
+            return {
+                "left": pt[0] + rel_x,
+                "top": pt[1] + rel_y,
+                "width": w,
+                "height": h,
+            }
 
         client_rect = {"left": pt[0], "top": pt[1], "width": cw, "height": ch}
         with mss.mss() as sct:
@@ -144,12 +156,31 @@ def auto_crop_white_field(hwnd, fallback_field):
             valid_x = np.where(col_canvas_score > 0.85)[0]
             if len(valid_x) > int(cw * 0.80):
                 x1, x2 = int(valid_x[0]), int(valid_x[-1])
+                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+                # Step inward past the 1px black border line without shaving white canvas pixels
+                for _ in range(2):
+                    if x1 < x2 and np.mean(gray[y1 : y2 + 1, x1]) < 120:
+                        x1 += 1
+                    if x2 > x1 and np.mean(gray[y1 : y2 + 1, x2]) < 120:
+                        x2 -= 1
+                    if y1 < y2 and np.mean(gray[y1, x1 : x2 + 1]) < 120:
+                        y1 += 1
+                    if y2 > y1 and np.mean(gray[y2, x1 : x2 + 1]) < 120:
+                        y2 -= 1
+
+                w = x2 - x1 + 1
+                h = y2 - y1 + 1
+                _CROP_CACHE[cache_key] = (x1, y1, w, h)
                 return {
-                    "left": pt[0] + x1 + 2,
-                    "top": pt[1] + y1 + 2,
-                    "width": (x2 - x1 + 1) - 4,
-                    "height": (y2 - y1 + 1) - 4,
+                    "left": pt[0] + x1,
+                    "top": pt[1] + y1,
+                    "width": w,
+                    "height": h,
                 }
     except Exception:
         pass
-    return fallback_field
+
+    safe_fallback = dict(fallback_field)
+    if safe_fallback.get("height", 0) > 500:
+        safe_fallback["height"] = int(safe_fallback["height"] * 0.90)
+    return safe_fallback

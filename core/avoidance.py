@@ -9,7 +9,7 @@ import math
 import cv2
 import numpy as np
 
-from .field_geometry import pixel_radius_to_game, pixel_to_game, game_to_pixel
+from .field_geometry import format_number, pixel_radius_to_game, pixel_to_game, game_to_pixel
 
 GAME_PRECISION = 5
 VERTICAL_MAX_COEFF = 999
@@ -26,7 +26,10 @@ class ObstacleMap:
         self.mask = clean_black_mask.astype(np.uint8)  # uint8, 255 = obstacle, 0 = free space
         self.w = int(field_w)
         self.h = int(field_h)
+        self.unit_per_px = 50.0 / max(1, self.w)
+        self._rebuild_sdf()
 
+    def _rebuild_sdf(self):
         # Extract exact contours (including bullet craters & small arcs) for visualization
         contours, _ = cv2.findContours(self.mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         self.contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= 15]
@@ -35,16 +38,48 @@ class ObstacleMap:
         free_space = cv2.bitwise_not(self.mask)
         self.dist_px = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
 
-        # Convert pixel distance to game coordinate units (50.0 / w horizontally, 30.0 / h vertically)
         # Isotropic scale (Graphwar Java AWT): 1 game unit on y == 1 game unit on x
-        self.unit_per_px = 50.0 / max(1, self.w)
         self.dist_game = self.dist_px * self.unit_per_px
 
-        # Also build a dense boundary circle list [(gx, gy, r_game), ...] sampled every 3px
+        # Build a dense boundary circle list [(gx, gy, r_game), ...] sampled every 2px
         # along all obstacle contours so any legacy code iterating over `dangers` still works!
-        self.boundary_circles = self._build_boundary_circles(step_px=3)
+        self.boundary_circles = self._build_boundary_circles(step_px=2)
 
-    def _build_boundary_circles(self, step_px=3):
+    def scrub_players(self, player_circles):
+        """
+        Remove dark soldier sprite pixels (helmets, rims, eyes) from the obstacle mask
+        without erasing large adjacent terrain obstacles.
+        """
+        if not player_circles:
+            return self
+
+        changed = False
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            self.mask, connectivity=8
+        )
+        for lbl in range(1, num_labels):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if area < 380:
+                lx, ly = centroids[lbl]
+                for px, py, pr in player_circles:
+                    if math.hypot(lx - px, ly - py) <= pr + 6:
+                        self.mask[labels == lbl] = 0
+                        changed = True
+                        break
+
+        for px, py, pr in player_circles:
+            ix, iy, ir = int(round(px)), int(round(py)), max(4, int(round(pr)) + 1)
+            y1, y2 = max(0, iy - ir), min(self.h, iy + ir + 1)
+            x1, x2 = max(0, ix - ir), min(self.w, ix + ir + 1)
+            if np.any(self.mask[y1:y2, x1:x2]):
+                cv2.circle(self.mask, (ix, iy), ir, 0, -1)
+                changed = True
+
+        if changed:
+            self._rebuild_sdf()
+        return self
+
+    def _build_boundary_circles(self, step_px=2):
         circles = []
         r_tiny = round(1.5 * self.unit_per_px, 5)
         for cnt in self.contours:
