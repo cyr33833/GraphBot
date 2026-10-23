@@ -13,7 +13,7 @@ import cv2
 
 from .avoidance import DEFAULT_CLEARANCE, ObstacleMap, fmt_game, segment_intersects_circle
 from .field_geometry import game_to_pixel, X_MIN, X_MAX, Y_MIN, Y_MAX
-COLS, ROWS = 100, 60
+COLS, ROWS = 200, 120
 
 NEIGHBORS = (
     (1, 0),
@@ -46,8 +46,12 @@ def cell_to_game(gi, gj):
     return fmt_game(x), fmt_game(y)
 
 
-def _cell_blocked(gi, gj, obstacles, margin):
+def _cell_blocked(gi, gj, obstacles, margin, allies=None):
     gx, gy = cell_to_game(gi, gj)
+    if allies:
+        for ax, ay, ar in allies:
+            if math.hypot(gx - ax, gy - ay) <= ar + margin + 0.25:
+                return True
     if isinstance(obstacles, ObstacleMap):
         return not obstacles.is_point_safe(gx, gy, clearance=margin)
     for ox, oy, r in obstacles:
@@ -56,9 +60,9 @@ def _cell_blocked(gi, gj, obstacles, margin):
     return False
 
 
-def _build_blocked_grid(obstacles, margin):
+def _build_blocked_grid(obstacles, margin, allies=None):
     return [
-        [_cell_blocked(gi, gj, obstacles, margin) for gj in range(ROWS)]
+        [_cell_blocked(gi, gj, obstacles, margin, allies) for gj in range(ROWS)]
         for gi in range(COLS)
     ]
 
@@ -107,27 +111,41 @@ def _heuristic(gi, gj, goal_i, goal_j, obstacles, margin):
     return dist + penalty
 
 
-def _segment_hits_any(p1, p2, obstacles, margin):
+def _segment_hits_any(p1, p2, obstacles, margin, allies=None):
+    if allies:
+        for ally in allies:
+            if segment_intersects_circle(p1, p2, ally, margin + 0.25):
+                return True
     if isinstance(obstacles, ObstacleMap):
         return not obstacles.is_segment_safe(p1, p2, clearance=margin)
     return any(segment_intersects_circle(p1, p2, o, margin) for o in obstacles)
 
 
-def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE):
+def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE, allies=None):
     """
     Find a path between game-coordinate points. Returns list of (x, y) or None.
+    Preserves exact start and goal coordinates (never quantizes endpoints to grid cells).
     """
-    margin = clearance
-    blocked = _build_blocked_grid(obstacles, margin)
+    start_exact = (fmt_game(start[0]), fmt_game(start[1]))
+    goal_exact = (fmt_game(goal[0]), fmt_game(goal[1]))
+    if goal_exact[0] + 1e-6 < start_exact[0]:
+        return None
 
-    start_i, start_j = game_to_cell(start[0], start[1])
-    goal_i, goal_j = game_to_cell(goal[0], goal[1])
+    margin = clearance
+    # Fast-path: if direct line of sight is completely clear, return exact [start, goal]
+    if not _segment_hits_any(start_exact, goal_exact, obstacles, margin, allies):
+        return [start_exact, goal_exact]
+
+    blocked = _build_blocked_grid(obstacles, margin, allies)
+
+    start_i, start_j = game_to_cell(start_exact[0], start_exact[1])
+    goal_i, goal_j = game_to_cell(goal_exact[0], goal_exact[1])
 
     # Unblocking radius around start/goal so characters inside craters/tunnels can be reached
     if isinstance(obstacles, ObstacleMap):
-        if obstacles.clearance_at_game(start[0], start[1]) > 0.0:
+        if obstacles.clearance_at_game(start_exact[0], start_exact[1]) > 0.0:
             blocked[start_i][start_j] = False
-        if obstacles.clearance_at_game(goal[0], goal[1]) > 0.0:
+        if obstacles.clearance_at_game(goal_exact[0], goal_exact[1]) > 0.0:
             blocked[goal_i][goal_j] = False
     else:
         blocked[start_i][start_j] = False
@@ -185,11 +203,15 @@ def astar_game(start, goal, obstacles, clearance=DEFAULT_CLEARANCE):
         cells.append(came_from[cells[-1]])
     cells.reverse()
 
-    return [cell_to_game(gi, gj) for gi, gj in cells]
+    pts = [cell_to_game(gi, gj) for gi, gj in cells]
+    if pts:
+        pts[0] = start_exact
+        pts[-1] = goal_exact
+    return pts
 
 
-def simplify_path(points, obstacles, margin):
-    """String-pull: keep only corners needed to avoid obstacles."""
+def simplify_path(points, obstacles, margin, allies=None):
+    """String-pull: keep only corners needed to avoid obstacles and allies."""
     if len(points) <= 2:
         return points
 
@@ -198,7 +220,10 @@ def simplify_path(points, obstacles, margin):
     while i < len(points) - 1:
         j = len(points) - 1
         while j > i + 1:
-            if not _segment_hits_any(points[i], points[j], obstacles, margin):
+            if (
+                points[j][0] >= points[i][0] - 1e-6
+                and not _segment_hits_any(points[i], points[j], obstacles, margin, allies)
+            ):
                 break
             j -= 1
         out.append(points[j])
@@ -210,6 +235,7 @@ def build_enemy_chain_astar(
     enemies,
     obstacles,
     clearance=DEFAULT_CLEARANCE,
+    allies=None,
 ):
     """
     Chain enemies with A* segments. First enemy = formula anchor (no active player).
@@ -230,12 +256,12 @@ def build_enemy_chain_astar(
             skipped.append(list(goal))
             continue
 
-        raw = astar_game(tuple(path[-1]), goal, obstacles, clearance=clearance)
+        raw = astar_game(tuple(path[-1]), goal, obstacles, clearance=clearance, allies=allies)
         if raw is None:
             skipped.append(list(goal))
             continue
 
-        simplified = simplify_path(raw, obstacles, margin)
+        simplified = simplify_path(raw, obstacles, margin, allies=allies)
         for pt in simplified[1:]:
             path.append([pt[0], pt[1]])
         hit.append(list(goal))

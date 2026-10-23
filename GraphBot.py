@@ -288,7 +288,7 @@ def safe_copy(text, previous_text):
         print("Safely copied!")
 
 
-def refresh_field():
+def refresh_field(sct=None):
     global field
 
     hwnd = find_game_window(game_window_name)
@@ -296,7 +296,7 @@ def refresh_field():
         return False
 
     raw_field = get_capture_field(hwnd, capture_margins)
-    field = auto_crop_white_field(hwnd, raw_field)
+    field = auto_crop_white_field(hwnd, raw_field, sct=sct)
     return True
 
 
@@ -362,7 +362,7 @@ def main():
         # Mode 0, Planner 2: Symbolic GA
         # ---------------------------------------------------------
         if not mode and auto_planner == 2:
-            if not refresh_field():
+            if not refresh_field(sct=mss_):
                 print("Graphwar window not found. Waiting...")
                 sleep_key(0.5)
                 continue
@@ -465,7 +465,7 @@ def main():
         # Mode 0, Planner 1: Polynomial Search
         # ---------------------------------------------------------
         if not mode and auto_planner == 1:
-            if not refresh_field():
+            if not refresh_field(sct=mss_):
                 print("Graphwar window not found. Waiting...")
                 sleep_key(0.5)
                 continue
@@ -586,7 +586,7 @@ def main():
         # ---------------------------------------------------------
         # Mode 0, Planner 0 (A*) OR Mode 1 (Clicks)
         # ---------------------------------------------------------
-        if not refresh_field():
+        if not refresh_field(sct=mss_):
             print("Graphwar window not found. Waiting...")
             sleep_key(0.5)
             continue
@@ -638,6 +638,7 @@ def main():
                 chain_targets,
                 obstacles_game,
                 clearance=DEFAULT_CLEARANCE,
+                allies=scene["allies_game"],
             )
 
             if len(path_waypoints) < 2 and enemy_centers_norm:
@@ -645,6 +646,7 @@ def main():
                     enemy_centers_norm,
                     obstacles_game,
                     clearance=DEFAULT_CLEARANCE,
+                    allies=scene["allies_game"],
                 )
 
             if len(path_waypoints) < 2 and enemy_centers_norm:

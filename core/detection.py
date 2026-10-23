@@ -1361,6 +1361,19 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
         if np.sum(body_pixels) < 35:
             continue
 
+        # 排除阵亡骷髅图标 (grave) 与爆炸火球：
+        # 1) 存活小兵下半身必有亮黄色躯干 (H in 17..40, S >= 95, V >= 125)
+        # 2) 爆炸火球内部全被红橙火焰填满且无深色/金属头盔像素
+        patch_hsv = hsv[y1:y2, x1:x2]
+        ph, ps, pv = patch_hsv[:, :, 0], patch_hsv[:, :, 1], patch_hsv[:, :, 2]
+        yellow_px = int(np.sum((ph >= 17) & (ph <= 40) & (ps >= 95) & (pv >= 125)))
+        if yellow_px < max(8, int(12 * (w / 770.0) ** 2)):
+            continue
+        orange_red_px = int(np.sum(((ph < 16) | (ph > 165)) & (ps > 100) & (pv > 100)))
+        helmet_px = int(np.sum((ps < 80) & (pv > 25) & (pv < 200)))
+        if orange_red_px > yellow_px * 1.8 and helmet_px < 10:
+            continue
+
         bm = cv2.moments(body_pixels.astype(np.uint8))
         if bm["m00"] > 0:
             rcx = x1 + bm["m10"] / bm["m00"]
@@ -1400,29 +1413,12 @@ def detect_all_players_robust(screenshot_bgr, obstacles):
         raw_red = cv2.countNonZero(roi_red)
         if raw_red < 12:
             continue
-        # 真正の発射红圈环绕小兵上下左右，而头顶红色名字牌只存在于小兵上方 (y < cy - 5)
+        # 真正的发射红圈环绕小兵上下左右，而头顶红色名字牌只存在于小兵上方 (y < cy - 5)
         lower_red = cv2.countNonZero(red_mask[min(h, max(0, cy)):ry2, rx1:rx2])
         score = float(raw_red) * (1.5 if lower_red >= 3 else 0.35)
         if score > best_red_score:
             best_red_score = score
             active_circle = c
-
-    if active_circle is None:
-        red_clean = cv2.bitwise_and(red_mask, cv2.bitwise_not(obs_mask))
-        rcnts, _ = cv2.findContours(red_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in rcnts:
-            if cv2.contourArea(cnt) < 20:
-                continue
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw > 34 or bh > 34 or bw / max(1, bh) > 1.45:
-                continue
-            gx, gy = int(round(x + bw / 2.0)), int(round(y + bh / 2.0))
-            if gx <= center_x:
-                patch = gray[max(0, gy - 5):min(h, gy + 6), max(0, gx - 5):min(w, gx + 6)]
-                if patch.size > 0 and np.mean(patch > 240) < 0.45:
-                    active_circle = (gx, gy, r_soldier)
-                    ours.append(active_circle)
-                    break
 
     if active_circle is None and ours:
         active_circle = ours[0]

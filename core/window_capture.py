@@ -22,8 +22,6 @@ DEFAULT_MARGINS = {
     "margin_bottom": 135,
 }
 
-_CROP_CACHE = {}
-
 
 def _set_process_dpi_awareness():
     """Keep Win32 window coordinates in the same pixel space as mss."""
@@ -79,6 +77,7 @@ def get_client_screen_rect(hwnd):
 def get_capture_field(hwnd, margins=None):
     """
     Build an mss-compatible region dict from the window client area.
+    Scales default 800x600 margins proportionally if the window is DPI-scaled.
 
     margins keys (pixels inside the client, not screen):
         margin_left, margin_top, margin_right, margin_bottom
@@ -86,10 +85,13 @@ def get_capture_field(hwnd, margins=None):
     cx, cy, cw, ch = get_client_screen_rect(hwnd)
     margins = margins or {}
 
-    ml = int(margins.get("margin_left", 0))
-    mt = int(margins.get("margin_top", 0))
-    mr = int(margins.get("margin_right", 0))
-    mb = int(margins.get("margin_bottom", 0))
+    scale_x = cw / 800.0 if cw > 200 else 1.0
+    scale_y = ch / 600.0 if ch > 200 else 1.0
+
+    ml = int(round(int(margins.get("margin_left", 0)) * scale_x))
+    mt = int(round(int(margins.get("margin_top", 0)) * scale_y))
+    mr = int(round(int(margins.get("margin_right", 0)) * scale_x))
+    mb = int(round(int(margins.get("margin_bottom", 0)) * scale_y))
 
     width = cw - ml - mr
     height = ch - mt - mb
@@ -107,10 +109,12 @@ def get_capture_field(hwnd, margins=None):
     }
 
 
-def auto_crop_white_field(hwnd, fallback_field, use_cache=True):
+def auto_crop_white_field(hwnd, fallback_field, sct=None):
     """
     Lock onto the interior white battle canvas bounded by the 1px black border,
     completely excluding the outer greenish-gray Java UI panel (g - r > 12 and g - b > 15).
+    If the window is temporarily covered (e.g. by the terminal during setup),
+    falls back to the exact DPI-scaled GraphPlane rectangle (16..784, 16..464 in 800x600).
     """
     try:
         left, top, right, bottom = win32gui.GetClientRect(hwnd)
@@ -119,19 +123,24 @@ def auto_crop_white_field(hwnd, fallback_field, use_cache=True):
         if cw <= 200 or ch <= 200:
             return fallback_field
 
-        cache_key = (int(hwnd), cw, ch)
-        if use_cache and cache_key in _CROP_CACHE:
-            rel_x, rel_y, w, h = _CROP_CACHE[cache_key]
-            return {
-                "left": pt[0] + rel_x,
-                "top": pt[1] + rel_y,
-                "width": w,
-                "height": h,
-            }
+        # Exact proportional GraphPlane interior fallback (never includes bottom UI even at 125%/150% DPI)
+        prop_x1 = int(round(16.0 * cw / 800.0))
+        prop_y1 = int(round(16.0 * ch / 600.0))
+        prop_w = int(round(768.0 * cw / 800.0))
+        prop_h = int(round(448.0 * ch / 600.0))
+        proportional_fallback = {
+            "left": pt[0] + prop_x1,
+            "top": pt[1] + prop_y1,
+            "width": prop_w,
+            "height": prop_h,
+        }
 
         client_rect = {"left": pt[0], "top": pt[1], "width": cw, "height": ch}
-        with mss.mss() as sct:
+        if sct is not None:
             img = np.array(sct.grab(client_rect))
+        else:
+            with mss.mss() as temp_sct:
+                img = np.array(temp_sct.grab(client_rect))
 
         b = img[:, :, 0].astype(np.int16)
         g = img[:, :, 1].astype(np.int16)
@@ -139,11 +148,22 @@ def auto_crop_white_field(hwnd, fallback_field, use_cache=True):
 
         # Outer Graphwar UI panel is greenish-gray
         is_green_panel = (g - r > 12) & (g - b > 15) & (g > 100) & (g < 230)
+
+        # Verify that the Graphwar green UI border is actually visible (not covered by terminal/IDE)
+        top_green_ratio = float(np.mean(is_green_panel[2 : max(4, int(ch * 0.02)), :]))
+        mid_bottom_y = int(ch * 0.782)
+        bot_green_ratio = float(
+            np.mean(is_green_panel[mid_bottom_y : min(ch, mid_bottom_y + max(4, int(ch * 0.015))), :])
+        )
+        if top_green_ratio < 0.45 or bot_green_ratio < 0.45:
+            return proportional_fallback
+
         not_panel = (~is_green_panel).astype(np.uint8)
         row_canvas_score = np.mean(not_panel, axis=1)
 
         y1, y2 = None, None
-        for y in range(int(ch * 0.90)):
+        # Only scan up to 80% of client height (battle canvas ends at 465/600 = 77.5%)
+        for y in range(int(ch * 0.80)):
             if row_canvas_score[y] > 0.85:
                 if y1 is None:
                     y1 = y
@@ -151,36 +171,37 @@ def auto_crop_white_field(hwnd, fallback_field, use_cache=True):
             elif y1 is not None and (y - y1) > int(ch * 0.45):
                 break
 
-        if y1 is not None and y2 is not None and (y2 - y1) > int(ch * 0.50):
+        if (
+            y1 is not None
+            and y2 is not None
+            and int(ch * 0.01) <= y1 <= int(ch * 0.045)
+            and int(ch * 0.72) <= (y2 - y1 + 1) <= int(ch * 0.775)
+        ):
             col_canvas_score = np.mean(not_panel[y1:y2, :], axis=0)
             valid_x = np.where(col_canvas_score > 0.85)[0]
-            if len(valid_x) > int(cw * 0.80):
+            if len(valid_x) > int(cw * 0.90):
                 x1, x2 = int(valid_x[0]), int(valid_x[-1])
-                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-                # Step inward past the 1px black border line without shaving white canvas pixels
-                for _ in range(2):
-                    if x1 < x2 and np.mean(gray[y1 : y2 + 1, x1]) < 120:
-                        x1 += 1
-                    if x2 > x1 and np.mean(gray[y1 : y2 + 1, x2]) < 120:
-                        x2 -= 1
-                    if y1 < y2 and np.mean(gray[y1, x1 : x2 + 1]) < 120:
-                        y1 += 1
-                    if y2 > y1 and np.mean(gray[y2, x1 : x2 + 1]) < 120:
-                        y2 -= 1
+                if int(cw * 0.01) <= x1 <= int(cw * 0.04) and int(cw * 0.93) <= (x2 - x1 + 1) <= int(cw * 0.985):
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+                    # Step inward past the 1px black border line without shaving white canvas pixels
+                    for _ in range(2):
+                        if x1 < x2 and np.mean(gray[y1 : y2 + 1, x1]) < 120:
+                            x1 += 1
+                        if x2 > x1 and np.mean(gray[y1 : y2 + 1, x2]) < 120:
+                            x2 -= 1
+                        if y1 < y2 and np.mean(gray[y1, x1 : x2 + 1]) < 120:
+                            y1 += 1
+                        if y2 > y1 and np.mean(gray[y2, x1 : x2 + 1]) < 120:
+                            y2 -= 1
 
-                w = x2 - x1 + 1
-                h = y2 - y1 + 1
-                _CROP_CACHE[cache_key] = (x1, y1, w, h)
-                return {
-                    "left": pt[0] + x1,
-                    "top": pt[1] + y1,
-                    "width": w,
-                    "height": h,
-                }
+                    return {
+                        "left": pt[0] + x1,
+                        "top": pt[1] + y1,
+                        "width": x2 - x1 + 1,
+                        "height": y2 - y1 + 1,
+                    }
+        return proportional_fallback
     except Exception:
         pass
 
-    safe_fallback = dict(fallback_field)
-    if safe_fallback.get("height", 0) > 500:
-        safe_fallback["height"] = int(safe_fallback["height"] * 0.90)
-    return safe_fallback
+    return fallback_field
